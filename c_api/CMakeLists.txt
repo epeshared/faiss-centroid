@@ -42,7 +42,7 @@ target_link_libraries(faiss_c PRIVATE faiss)
 
 add_library(faiss_c_avx2 ${FAISS_C_SRC})
 target_link_libraries(faiss_c_avx2 PRIVATE faiss_avx2)
-if(NOT FAISS_OPT_LEVEL STREQUAL "avx2" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr")
+if(NOT FAISS_OPT_LEVEL STREQUAL "avx2" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512" AND NOT FAISS_OPT_LEVEL STREQUAL "avx512_spr" AND NOT FAISS_OPT_LEVEL STREQUAL "amx")
   set_target_properties(faiss_c_avx2 PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 if(NOT WIN32)
@@ -79,6 +79,17 @@ if(NOT WIN32)
   target_compile_options(faiss_c_avx512_spr PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids>)
 else()
   target_compile_options(faiss_c_avx512_spr PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
+endif()
+
+add_library(faiss_c_amx ${FAISS_C_SRC})
+target_link_libraries(faiss_c_amx PRIVATE faiss_amx)
+if(NOT FAISS_OPT_LEVEL STREQUAL "amx")
+  set_target_properties(faiss_c_amx PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+if(NOT WIN32)
+  target_compile_options(faiss_c_amx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids>)
+else()
+  target_compile_options(faiss_c_amx PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
 endif()
 
 add_library(faiss_c_sve ${FAISS_C_SRC})
@@ -145,6 +156,13 @@ if(FAISS_OPT_LEVEL STREQUAL "avx512")
 endif()
 if(FAISS_OPT_LEVEL STREQUAL "avx512_spr")
   install(TARGETS faiss_c_avx2 faiss_c_avx512_spr
+    EXPORT faiss-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  )
+endif()
+if(FAISS_OPT_LEVEL STREQUAL "amx")
+  install(TARGETS faiss_c_avx2 faiss_c_amx
     EXPORT faiss-targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

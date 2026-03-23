@@ -848,7 +848,7 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
                 ? fourcc("IHfP")
                 : dynamic_cast<const IndexHNSWFlat*>(idx)   ? fourcc("IHNf")
                 : dynamic_cast<const IndexHNSWPQ*>(idx)     ? fourcc("IHNp")
-                : dynamic_cast<const IndexHNSWSQ*>(idx)     ? fourcc("IHNs")
+                : dynamic_cast<const IndexHNSWSQ*>(idx)     ? fourcc("IHS3")
                 : dynamic_cast<const IndexHNSW2Level*>(idx) ? fourcc("IHN2")
                 : dynamic_cast<const IndexHNSWCagra*>(idx)  ? fourcc("IHc2")
                                                             : 0;
@@ -874,6 +874,16 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
             WRITE1(n4);
         } else {
             write_index(idxhnsw->storage, f);
+        }
+        if (h == fourcc("IHS3")) {
+            auto idxsq = dynamic_cast<const IndexHNSWSQ*>(idxhnsw);
+            WRITE1(idxsq->use_block_centroid_search);
+            WRITEVECTOR(idxsq->block_offsets);
+            WRITEVECTOR(idxsq->reordered_to_original);
+            WRITEVECTOR(idxsq->original_to_reordered);
+            WRITEVECTOR(idxsq->original_database);
+            WRITEVECTOR(idxsq->block_centroids);
+            write_HNSW(&idxsq->centroid_hnsw, f);
         }
     } else if (const IndexNSG* idxnsg = dynamic_cast<const IndexNSG*>(idx)) {
         uint32_t h = dynamic_cast<const IndexNSGFlat*>(idx) ? fourcc("INSf")

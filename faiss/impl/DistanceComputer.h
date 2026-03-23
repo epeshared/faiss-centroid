@@ -53,6 +53,15 @@ struct DistanceComputer {
         dis3 = d3;
     }
 
+    virtual void distances_batch_16(
+            const idx_t* idx,
+            size_t count,
+            float* dis) {
+        for (size_t i = 0; i < count; ++i) {
+            dis[i] = this->operator()(idx[i]);
+        }
+    }
+
     /// compute distance between two stored vectors
     virtual float symmetric_dis(idx_t i, idx_t j) = 0;
 
@@ -93,6 +102,16 @@ struct NegativeDistanceComputer : DistanceComputer {
         dis1 = -dis1;
         dis2 = -dis2;
         dis3 = -dis3;
+    }
+
+    void distances_batch_16(
+            const idx_t* idx,
+            size_t count,
+            float* dis) override {
+        basedis->distances_batch_16(idx, count, dis);
+        for (size_t i = 0; i < count; ++i) {
+            dis[i] = -dis[i];
+        }
     }
 
     /// compute distance between two stored vectors

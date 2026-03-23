@@ -61,7 +61,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
-# Valid values are "generic", "avx2", "avx512", "avx512_spr", "sve".
+# Valid values are "generic", "avx2", "avx512", "avx512_spr", "amx", "sve".
 option(FAISS_OPT_LEVEL "" "generic")
 option(FAISS_ENABLE_GPU "Enable support for GPU indexes." ON)
 option(FAISS_GPU_STATIC "Link GPU libraries statically." OFF)
@@ -73,6 +73,7 @@ option(FAISS_ENABLE_C_API "Build C API." OFF)
 option(FAISS_ENABLE_EXTRAS "Build extras like benchmarks and demos" ON)
 option(FAISS_USE_LTO "Enable Link-Time optimization" OFF)
 option(FAISS_ENABLE_SVS "Enable SVS (Intel(R) Scalable Vector Search) integration." OFF)
+option(FAISS_ENABLE_HNSWSQ_BLOCK_AMX "Enable AMX BF16 batch16 kernel for HNSWSQ block scans." OFF)
 set(FAISS_SVS_RUNTIME_VERSION "v0" CACHE STRING "Version of the SVS runtime API to use")
 set_property(CACHE FAISS_SVS_RUNTIME_VERSION PROPERTY STRINGS "v0")
 

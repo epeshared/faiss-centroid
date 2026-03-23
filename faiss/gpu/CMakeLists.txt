@@ -286,6 +286,7 @@ if(FAISS_ENABLE_CUVS)
   target_compile_definitions(faiss_avx2 PUBLIC USE_NVIDIA_CUVS=1)
   target_compile_definitions(faiss_avx512 PUBLIC USE_NVIDIA_CUVS=1)
   target_compile_definitions(faiss_avx512_spr PUBLIC USE_NVIDIA_CUVS=1)
+  target_compile_definitions(faiss_amx PUBLIC USE_NVIDIA_CUVS=1)
 
   # Mark all functions as hidden so that we don't generate
   # global 'public' functions that also exist in libcuvs.so
@@ -328,6 +329,7 @@ target_link_libraries(faiss PRIVATE  faiss_gpu_objs)
 target_link_libraries(faiss_avx2 PRIVATE faiss_gpu_objs)
 target_link_libraries(faiss_avx512 PRIVATE faiss_gpu_objs)
 target_link_libraries(faiss_avx512_spr PRIVATE faiss_gpu_objs)
+target_link_libraries(faiss_amx PRIVATE faiss_gpu_objs)
 target_link_libraries(faiss_sve PRIVATE faiss_gpu_objs)
 
 install(TARGETS faiss_gpu_objs EXPORT faiss-targets)

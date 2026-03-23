@@ -102,8 +102,19 @@ else:
     instruction_sets.add(opt_level)
 
 loaded = False
+has_AMX = any("AMX" in x.upper() for x in instruction_sets)
+if has_AMX:
+    try:
+        logger.info("Loading faiss with AMX support.")
+        from .swigfaiss_amx import *
+        logger.info("Successfully loaded faiss with AMX support.")
+        loaded = True
+    except ImportError as e:
+        logger.info(f"Could not load library with AMX support due to:\n{e!r}")
+        loaded = False
+
 has_AVX512_SPR = any("AVX512_SPR" in x.upper() for x in instruction_sets)
-if has_AVX512_SPR:
+if has_AVX512_SPR and not loaded:
     try:
         logger.info("Loading faiss with AVX512-SPR support.")
         from .swigfaiss_avx512_spr import *
@@ -168,6 +179,9 @@ if not loaded:
 
             f"These are the supported instruction sets on your system:\n"
             f"{formatted_ins_sets}\n"
+            f"- If you configured the build with FAISS_OPT_LEVEL=amx, you must "
+            f"build the 'swigfaiss_amx' target and run with "
+            f"FAISS_OPT_LEVEL=amx.\n"
             f"- If 'AVX512_SPR' (case insensitive) is supported on your "
             f"system, you can set the FAISS_OPT_LEVEL=avx512_spr "
             f"to build the SWIG wrapper with 'AVX512-SPR' support.\n"

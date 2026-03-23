@@ -22,12 +22,15 @@
 #include "faiss/Index.h"
 
 #include <faiss/Index2Layer.h>
+#include <faiss/Clustering.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/impl/VisitedTable.h>
+#include <faiss/impl/scalar_quantizer/amx_bf16_block16.h>
+#include <faiss/utils/bf16.h>
 #include <faiss/utils/random.h>
 #include <faiss/utils/sorting.h>
 
@@ -734,6 +737,503 @@ void IndexHNSWPQ::train(idx_t n, const float* x) {
 }
 
 /**************************************************************
+ * IndexHNSWSQ helpers
+ **************************************************************/
+
+namespace {
+
+struct HNSWSQBlockSearchConfig {
+    bool use_block_centroid_search = false;
+    int top_b = -1;
+    int centroid_ef_construction = 0;
+    int centroid_ef_search = 0;
+};
+
+// HNSWSQ BF16 runtime configuration, read once per process from environment.
+// This config only affects the optional block-centroid path for
+// IndexHNSWSQ + ScalarQuantizer::QT_bf16.
+//
+// Supported variables:
+// - FAISS_HNSWSQ_BF16_USE_BLOCK_CENTROID_SEARCH
+//     Enables the optional 16-vector block + centroid-HNSW path.
+//     Accepted true values: 1/true/yes/on.
+//     Accepted false values: 0/false/no/off.
+//     Default: false.
+// - FAISS_HNSWSQ_BF16_TOP_B
+//     Number of centroid-selected blocks to scan per query.
+//     Default: top-k.
+// - FAISS_HNSWSQ_BF16_CENTROID_EFC
+//     efConstruction used when building the centroid HNSW.
+//     Default: reuse the main HNSW efConstruction.
+// - FAISS_HNSWSQ_BF16_CENTROID_EFS
+//     efSearch used when searching the centroid HNSW.
+//     Default: reuse the main HNSW/SearchParametersHNSW efSearch.
+
+bool getenv_bool_once(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+
+    if (!strcmp(value, "1") || !strcasecmp(value, "true") ||
+        !strcasecmp(value, "yes") || !strcasecmp(value, "on")) {
+        return true;
+    }
+    if (!strcmp(value, "0") || !strcasecmp(value, "false") ||
+        !strcasecmp(value, "no") || !strcasecmp(value, "off")) {
+        return false;
+    }
+    return default_value;
+}
+
+int getenv_int_once(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return default_value;
+    }
+
+    char* endptr = nullptr;
+    long parsed = std::strtol(value, &endptr, 10);
+    if (endptr == value || *endptr != '\0') {
+        return default_value;
+    }
+    if (parsed < std::numeric_limits<int>::min()) {
+        return default_value;
+    }
+    if (parsed > std::numeric_limits<int>::max()) {
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+const HNSWSQBlockSearchConfig& get_hnswsq_block_search_config() {
+    static const HNSWSQBlockSearchConfig config = {
+        getenv_bool_once(
+            "FAISS_HNSWSQ_BF16_USE_BLOCK_CENTROID_SEARCH",
+            false),
+            getenv_int_once("FAISS_HNSWSQ_BF16_TOP_B", -1),
+            getenv_int_once("FAISS_HNSWSQ_BF16_CENTROID_EFC", 0),
+            getenv_int_once("FAISS_HNSWSQ_BF16_CENTROID_EFS", 0)};
+    return config;
+}
+
+bool is_hnswsq_bf16(const IndexHNSWSQ& index) {
+    const auto* sq_storage = dynamic_cast<const IndexScalarQuantizer*>(index.storage);
+    return sq_storage &&
+            sq_storage->sq.qtype == ScalarQuantizer::QT_bf16;
+}
+
+struct ProfilingDistanceComputer : DistanceComputer {
+    std::unique_ptr<DistanceComputer> base;
+    double distance_compute_time_s = 0.0;
+
+    explicit ProfilingDistanceComputer(std::unique_ptr<DistanceComputer> base)
+            : base(std::move(base)) {}
+
+    void set_query(const float* x) override {
+        base->set_query(x);
+    }
+
+    float operator()(idx_t i) override {
+        const double t0 = getmillisecs();
+        const float result = (*base)(i);
+        distance_compute_time_s += (getmillisecs() - t0) * 1e-3;
+        return result;
+    }
+
+    void distances_batch_4(
+            const idx_t idx0,
+            const idx_t idx1,
+            const idx_t idx2,
+            const idx_t idx3,
+            float& dis0,
+            float& dis1,
+            float& dis2,
+            float& dis3) override {
+        const double t0 = getmillisecs();
+        base->distances_batch_4(idx0, idx1, idx2, idx3, dis0, dis1, dis2, dis3);
+        distance_compute_time_s += (getmillisecs() - t0) * 1e-3;
+    }
+
+    void distances_batch_16(const idx_t* idx, size_t count, float* dis) override {
+        const double t0 = getmillisecs();
+        base->distances_batch_16(idx, count, dis);
+        distance_compute_time_s += (getmillisecs() - t0) * 1e-3;
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        const double t0 = getmillisecs();
+        const float result = base->symmetric_dis(i, j);
+        distance_compute_time_s += (getmillisecs() - t0) * 1e-3;
+        return result;
+    }
+};
+
+void clear_hnswsq_search_profile(IndexHNSWSQ& index) {
+    index.last_search_profile = HNSWSQSearchProfile();
+}
+
+void clear_hnswsq_block_state(IndexHNSWSQ& index) {
+    clear_hnswsq_search_profile(index);
+    index.block_offsets.clear();
+    index.reordered_to_original.clear();
+    index.original_to_reordered.clear();
+    index.original_database.clear();
+    index.block_centroids.clear();
+    index.centroid_storage = IndexScalarQuantizer(
+            index.d,
+            ScalarQuantizer::QT_bf16,
+            index.metric_type);
+    index.centroid_hnsw = HNSW(index.hnsw.nb_neighbors(1));
+}
+
+void rebuild_hnswsq_centroid_storage(IndexHNSWSQ& index) {
+    index.centroid_storage = IndexScalarQuantizer(
+            index.d,
+            ScalarQuantizer::QT_bf16,
+            index.metric_type);
+    if (!index.block_centroids.empty()) {
+        idx_t nblocks = index.block_centroids.size() / index.d;
+        index.centroid_storage.add(nblocks, index.block_centroids.data());
+    }
+}
+
+struct ProposalEntry {
+    float distance;
+    idx_t block_id;
+    idx_t vector_id;
+};
+
+void encode_matrix_bf16(
+        const float* input,
+        idx_t rows,
+        idx_t dim,
+        std::vector<uint16_t>& output) {
+    output.resize(static_cast<size_t>(rows) * dim);
+    for (idx_t i = 0; i < rows * dim; ++i) {
+        output[i] = encode_bf16(input[i]);
+    }
+}
+
+void insert_topk_similarity(
+        float score,
+        idx_t label,
+        float* top_scores,
+        idx_t* top_labels,
+        idx_t k) {
+    if (k <= 0 || score <= top_scores[k - 1]) {
+        return;
+    }
+
+    idx_t pos = k - 1;
+    while (pos > 0 && score > top_scores[pos - 1]) {
+        top_scores[pos] = top_scores[pos - 1];
+        top_labels[pos] = top_labels[pos - 1];
+        --pos;
+    }
+    top_scores[pos] = score;
+    top_labels[pos] = label;
+}
+
+void insert_topk_distance(
+        float score,
+        idx_t label,
+        float* top_scores,
+        idx_t* top_labels,
+        idx_t k) {
+    if (k <= 0 || score >= top_scores[k - 1]) {
+        return;
+    }
+
+    idx_t pos = k - 1;
+    while (pos > 0 && score < top_scores[pos - 1]) {
+        top_scores[pos] = top_scores[pos - 1];
+        top_labels[pos] = top_labels[pos - 1];
+        --pos;
+    }
+    top_scores[pos] = score;
+    top_labels[pos] = label;
+}
+
+void collect_centroid_candidates_bf16(
+        const float* x,
+        idx_t n,
+        idx_t d,
+    const float* centroids,
+    idx_t nblocks,
+    MetricType metric_type,
+        idx_t candidate_k,
+        std::vector<ProposalEntry>& candidates) {
+    const bool use_similarity = metric_type == METRIC_INNER_PRODUCT;
+    const bool use_amx_ip = use_similarity;
+
+    std::vector<uint16_t> database_bf16;
+    std::vector<uint16_t> centroid_bf16;
+    encode_matrix_bf16(x, n, d, database_bf16);
+    encode_matrix_bf16(centroids, nblocks, d, centroid_bf16);
+
+    const idx_t query_batch_size = 32;
+    candidates.clear();
+    candidates.resize(static_cast<size_t>(nblocks) * candidate_k);
+
+#pragma omp parallel for schedule(dynamic)
+    for (idx_t centroid_begin = 0; centroid_begin < nblocks;
+         centroid_begin += query_batch_size) {
+        const idx_t query_count =
+                std::min<idx_t>(query_batch_size, nblocks - centroid_begin);
+        std::vector<float> top_scores(query_count * candidate_k);
+        std::vector<idx_t> top_labels(query_count * candidate_k, -1);
+
+        if (use_similarity) {
+            std::fill(
+                    top_scores.begin(),
+                    top_scores.end(),
+                    -std::numeric_limits<float>::infinity());
+        } else {
+            std::fill(
+                    top_scores.begin(),
+                    top_scores.end(),
+                    std::numeric_limits<float>::infinity());
+        }
+
+        std::vector<float> block_scores(query_count * 16);
+
+        for (idx_t database_begin = 0; database_begin < n; database_begin += 16) {
+            const idx_t row_count = std::min<idx_t>(16, n - database_begin);
+            bool used_amx = false;
+
+            if (use_amx_ip) {
+                used_amx =
+                        scalar_quantizer::detail::hnswsq_bf16_amx_batch_queries_x16(
+                                database_bf16.data() + database_begin * d,
+                                centroid_bf16.data() + centroid_begin * d,
+                                static_cast<size_t>(d),
+                                static_cast<size_t>(row_count),
+                                static_cast<size_t>(query_count),
+                                block_scores.data()) == 0;
+            }
+
+            for (idx_t local_query = 0; local_query < query_count; ++local_query) {
+                const float* query = centroids + (centroid_begin + local_query) * d;
+                float* query_top_scores =
+                        top_scores.data() + local_query * candidate_k;
+                idx_t* query_top_labels =
+                        top_labels.data() + local_query * candidate_k;
+
+                for (idx_t local_row = 0; local_row < row_count; ++local_row) {
+                    const idx_t vector_id = database_begin + local_row;
+                    float score = 0.0f;
+                    if (used_amx) {
+                        score =
+                                block_scores[local_query * row_count + local_row];
+                    } else if (use_similarity) {
+                        const uint16_t* query_bf16 =
+                                centroid_bf16.data() + (centroid_begin + local_query) * d;
+                        const uint16_t* vector_bf16 =
+                                database_bf16.data() + vector_id * d;
+                        for (idx_t dim = 0; dim < d; ++dim) {
+                            score += decode_bf16(query_bf16[dim]) *
+                                    decode_bf16(vector_bf16[dim]);
+                        }
+                    } else {
+                        const float* vector = x + vector_id * d;
+                        for (idx_t dim = 0; dim < d; ++dim) {
+                            const float diff = query[dim] - vector[dim];
+                            score += diff * diff;
+                        }
+                    }
+
+                    if (use_similarity) {
+                        insert_topk_similarity(
+                                score,
+                                vector_id,
+                                query_top_scores,
+                                query_top_labels,
+                                candidate_k);
+                    } else {
+                        insert_topk_distance(
+                                score,
+                                vector_id,
+                                query_top_scores,
+                                query_top_labels,
+                                candidate_k);
+                    }
+                }
+            }
+        }
+
+        for (idx_t local_query = 0; local_query < query_count; ++local_query) {
+            const idx_t block_id = centroid_begin + local_query;
+            for (idx_t rank = 0; rank < candidate_k; ++rank) {
+                const size_t local_offset =
+                        static_cast<size_t>(local_query) * candidate_k + rank;
+                const size_t global_offset =
+                        static_cast<size_t>(block_id) * candidate_k + rank;
+                candidates[global_offset] = {
+                        top_scores[local_offset], block_id, top_labels[local_offset]};
+            }
+        }
+    }
+}
+
+void collect_block_members(
+        const float* x,
+        idx_t n,
+        idx_t d,
+    const float* centroids,
+    idx_t nblocks,
+    MetricType metric_type,
+        idx_t block_size,
+        std::vector<idx_t>& block_members) {
+    FAISS_THROW_IF_NOT(nblocks > 0);
+
+    std::vector<ProposalEntry> candidates;
+    collect_centroid_candidates_bf16(
+            x,
+            n,
+            d,
+        centroids,
+        nblocks,
+        metric_type,
+            block_size,
+            candidates);
+
+    block_members.resize(static_cast<size_t>(nblocks) * block_size);
+    for (idx_t block_id = 0; block_id < nblocks; ++block_id) {
+        for (idx_t rank = 0; rank < block_size; ++rank) {
+            const ProposalEntry& candidate =
+                    candidates[static_cast<size_t>(block_id) * block_size + rank];
+            FAISS_THROW_IF_NOT_FMT(
+                    candidate.vector_id >= 0,
+                    "block %" PRId64 " top-%" PRId64 " candidate missing",
+                    int64_t(block_id),
+                    int64_t(rank));
+            block_members[static_cast<size_t>(block_id) * block_size + rank] =
+                    candidate.vector_id;
+        }
+    }
+}
+
+void rebuild_hnswsq_bf16_blocks(IndexHNSWSQ& index, idx_t n, const float* x) {
+    idx_t old_total = index.ntotal;
+    idx_t total = old_total + n;
+    auto* sq_storage = dynamic_cast<IndexScalarQuantizer*>(index.storage);
+    FAISS_THROW_IF_NOT(sq_storage != nullptr);
+
+    const float* database = x;
+    std::vector<float> database_copy;
+    if (old_total > 0) {
+        database_copy.resize(total * index.d);
+        if (index.original_database.size() ==
+            static_cast<size_t>(old_total * index.d)) {
+            memcpy(
+                database_copy.data(),
+                index.original_database.data(),
+                sizeof(float) * old_total * index.d);
+        } else {
+            for (idx_t i = 0; i < old_total; i++) {
+            index.reconstruct(i, database_copy.data() + i * index.d);
+            }
+        }
+        memcpy(
+                database_copy.data() + old_total * index.d,
+                x,
+                sizeof(float) * n * index.d);
+        database = database_copy.data();
+    }
+
+        std::vector<float> original_database_copy(
+            database, database + total * index.d);
+
+    clear_hnswsq_block_state(index);
+    sq_storage->reset();
+    index.hnsw.reset();
+
+    if (total < IndexHNSWSQ::kBlockSize ||
+        total % IndexHNSWSQ::kBlockSize != 0) {
+        sq_storage->add(total, database);
+        index.ntotal = sq_storage->ntotal;
+        return;
+    }
+
+    idx_t nblocks = total / IndexHNSWSQ::kBlockSize;
+
+    ClusteringParameters cp;
+    cp.min_points_per_centroid = 1;
+    cp.max_points_per_centroid = std::max<int>(
+            cp.max_points_per_centroid,
+            static_cast<int>(IndexHNSWSQ::kBlockSize * 4));
+    cp.spherical = index.metric_type == METRIC_INNER_PRODUCT;
+    IndexFlat clustering_index(index.d, index.metric_type);
+    Clustering clustering(index.d, nblocks, cp);
+    clustering.train(total, database, clustering_index);
+
+    index.block_centroids = clustering.centroids;
+    rebuild_hnswsq_centroid_storage(index);
+        index.original_database = std::move(original_database_copy);
+
+        std::vector<idx_t> block_members;
+        collect_block_members(
+            database,
+            total,
+            index.d,
+                index.block_centroids.data(),
+                nblocks,
+                index.metric_type,
+            IndexHNSWSQ::kBlockSize,
+            block_members);
+
+    index.block_offsets.resize(nblocks + 1);
+    index.block_offsets[0] = 0;
+    for (idx_t block_id = 0; block_id < nblocks; block_id++) {
+        index.block_offsets[block_id + 1] =
+                index.block_offsets[block_id] + IndexHNSWSQ::kBlockSize;
+    }
+
+    index.reordered_to_original = block_members;
+    index.original_to_reordered.clear();
+
+    std::vector<float> encode_batch(IndexHNSWSQ::kBlockSize * index.d);
+    for (idx_t i0 = 0; i0 < total; i0 += IndexHNSWSQ::kBlockSize) {
+        idx_t batch_size = std::min<idx_t>(IndexHNSWSQ::kBlockSize, total - i0);
+        for (idx_t j = 0; j < batch_size; j++) {
+            idx_t original_id = index.reordered_to_original[i0 + j];
+            memcpy(
+                    encode_batch.data() + j * index.d,
+                    database + original_id * index.d,
+                    sizeof(float) * index.d);
+        }
+        sq_storage->add(batch_size, encode_batch.data());
+    }
+    index.ntotal = sq_storage->ntotal;
+
+    const auto& config = get_hnswsq_block_search_config();
+    int centroid_M = index.hnsw.nb_neighbors(1);
+    index.centroid_hnsw = HNSW(centroid_M);
+    index.centroid_hnsw.efConstruction =
+            config.centroid_ef_construction > 0 ? config.centroid_ef_construction
+                                                : index.hnsw.efConstruction;
+    index.centroid_hnsw.efSearch =
+            config.centroid_ef_search > 0 ? config.centroid_ef_search
+                                          : index.hnsw.efSearch;
+
+    IndexHNSW centroid_index(&index.centroid_storage, centroid_M);
+    centroid_index.own_fields = false;
+    centroid_index.hnsw = index.centroid_hnsw;
+    centroid_index.ntotal = index.centroid_storage.ntotal;
+    hnsw_add_vertices(
+            centroid_index,
+            0,
+            nblocks,
+            index.block_centroids.data(),
+            index.verbose,
+            false);
+    index.centroid_hnsw = centroid_index.hnsw;
+}
+
+} // namespace
+
+/**************************************************************
  * IndexHNSWSQ implementation
  **************************************************************/
 
@@ -742,12 +1242,262 @@ IndexHNSWSQ::IndexHNSWSQ(
         ScalarQuantizer::QuantizerType qtype,
         int M,
         MetricType metric)
-        : IndexHNSW(new IndexScalarQuantizer(d, qtype, metric), M) {
+        : IndexHNSW(new IndexScalarQuantizer(d, qtype, metric), M),
+                    centroid_storage(d, ScalarQuantizer::QT_bf16, metric),
+          centroid_hnsw(M) {
     is_trained = this->storage->is_trained;
     own_fields = true;
 }
 
 IndexHNSWSQ::IndexHNSWSQ() = default;
+
+void IndexHNSWSQ::add(idx_t n, const float* x) {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "Please use IndexHNSWSQ with an underlying SQ storage");
+    FAISS_THROW_IF_NOT(is_trained);
+
+    const auto& config = get_hnswsq_block_search_config();
+    use_block_centroid_search = config.use_block_centroid_search;
+
+    // Fall back to the standard HNSWSQ path unless this is BF16 and the
+    // optional block-centroid mode is explicitly enabled.
+    if (!is_hnswsq_bf16(*this) || !config.use_block_centroid_search) {
+        IndexHNSW::add(n, x);
+        return;
+    }
+
+    rebuild_hnswsq_bf16_blocks(*this, n, x);
+}
+
+void IndexHNSWSQ::search(
+        idx_t n,
+        const float* x,
+        idx_t k,
+        float* distances,
+        idx_t* labels,
+        const SearchParameters* params) const {
+    FAISS_THROW_IF_NOT(k > 0);
+
+    auto& mutable_self = const_cast<IndexHNSWSQ&>(*this);
+    clear_hnswsq_search_profile(mutable_self);
+
+    const auto& config = get_hnswsq_block_search_config();
+
+    // The custom centroid-HNSW + block-scan search path is BF16-only.
+    if (!is_hnswsq_bf16(*this) || !config.use_block_centroid_search ||
+        block_offsets.empty() || block_centroids.empty()) {
+        storage->search(n, x, k, distances, labels, params);
+        return;
+    }
+
+    const IDSelector* sel = params ? params->sel : nullptr;
+    idx_t nblocks = block_offsets.size() - 1;
+
+    int centroid_ef_search = config.centroid_ef_search;
+    if (centroid_ef_search <= 0) {
+        centroid_ef_search = centroid_hnsw.efSearch;
+        if (const SearchParametersHNSW* hnsw_params =
+                    dynamic_cast<const SearchParametersHNSW*>(params)) {
+            centroid_ef_search = hnsw_params->efSearch;
+        }
+    }
+
+    const double total_t0 = getmillisecs();
+    double centroid_search_time_s = 0.0;
+    double centroid_distance_compute_time_s = 0.0;
+    double block_scan_time_s = 0.0;
+    idx_t centroid_hnsw_searches = 0;
+    idx_t centroid_hnsw_candidate_exhaustions = 0;
+    idx_t centroid_hnsw_distance_computations = 0;
+    idx_t centroid_hnsw_hops = 0;
+    idx_t blocks_scanned = 0;
+    idx_t batch16_blocks_scanned = 0;
+    idx_t scalar_blocks_scanned = 0;
+    idx_t vectors_scanned = 0;
+
+#pragma omp parallel
+    {
+        std::unique_ptr<DistanceComputer> storage_dis(
+                storage_distance_computer(storage));
+
+        SearchParametersHNSW centroid_params;
+        centroid_params.efSearch = centroid_ef_search;
+
+    #pragma omp for reduction(+ : centroid_search_time_s, centroid_distance_compute_time_s, block_scan_time_s, centroid_hnsw_searches, centroid_hnsw_candidate_exhaustions, centroid_hnsw_distance_computations, centroid_hnsw_hops, blocks_scanned, batch16_blocks_scanned, scalar_blocks_scanned, vectors_scanned)
+        for (idx_t qi = 0; qi < n; qi++) {
+            float* query_distances = distances + qi * k;
+            idx_t* query_labels = labels + qi * k;
+            maxheap_heapify(k, query_distances, query_labels);
+
+            idx_t top_b = config.top_b > 0 ? config.top_b : k;
+            top_b = std::max<idx_t>(1, std::min<idx_t>(top_b, nblocks));
+
+            std::vector<float> centroid_distances(top_b);
+            std::vector<idx_t> centroid_labels(top_b);
+            using RH = HeapBlockResultHandler<HNSW::C>;
+            RH centroid_results(
+                    1,
+                    centroid_distances.data(),
+                    centroid_labels.data(),
+                    top_b);
+
+            IndexHNSW centroid_index(const_cast<IndexScalarQuantizer*>(&centroid_storage),
+                                     centroid_hnsw.nb_neighbors(1));
+            centroid_index.own_fields = false;
+            centroid_index.hnsw = centroid_hnsw;
+            centroid_index.ntotal = centroid_storage.ntotal;
+
+            const double centroid_t0 = getmillisecs();
+                RH::SingleResultHandler centroid_result(centroid_results);
+                VisitedTable centroid_vt(
+                    centroid_index.ntotal,
+                    centroid_index.hnsw.use_visited_hashset);
+                auto centroid_dis = std::make_unique<ProfilingDistanceComputer>(
+                    std::unique_ptr<DistanceComputer>(
+                        storage_distance_computer(centroid_index.storage)));
+                centroid_result.begin(0);
+                centroid_dis->set_query(x + qi * d);
+                HNSWStats centroid_stats = centroid_index.hnsw.search(
+                    *centroid_dis,
+                    &centroid_index,
+                    centroid_result,
+                    centroid_vt,
+                    &centroid_params);
+                centroid_result.end();
+            centroid_search_time_s += (getmillisecs() - centroid_t0) * 1e-3;
+                centroid_distance_compute_time_s +=
+                    centroid_dis->distance_compute_time_s;
+                centroid_hnsw_searches += static_cast<idx_t>(centroid_stats.n1);
+                centroid_hnsw_candidate_exhaustions +=
+                    static_cast<idx_t>(centroid_stats.n2);
+                centroid_hnsw_distance_computations +=
+                    static_cast<idx_t>(centroid_stats.ndis);
+                centroid_hnsw_hops += static_cast<idx_t>(centroid_stats.nhops);
+
+            storage_dis->set_query(x + qi * d);
+            const double block_scan_t0 = getmillisecs();
+            for (idx_t bi = 0; bi < top_b; bi++) {
+                idx_t block_id = centroid_labels[bi];
+                if (block_id < 0) {
+                    continue;
+                }
+                const idx_t block_begin = block_offsets[block_id];
+                const idx_t block_end = block_offsets[block_id + 1];
+                const idx_t block_count = block_end - block_begin;
+                blocks_scanned++;
+                vectors_scanned += block_count;
+
+                if (!sel && block_count == kBlockSize) {
+                    batch16_blocks_scanned++;
+                    idx_t block_indices[kBlockSize];
+                    float block_distances[kBlockSize];
+                    for (idx_t j = 0; j < kBlockSize; ++j) {
+                        block_indices[j] = block_begin + j;
+                    }
+                    storage_dis->distances_batch_16(
+                            block_indices,
+                            static_cast<size_t>(kBlockSize),
+                            block_distances);
+
+                    for (idx_t j = 0; j < kBlockSize; ++j) {
+                        if (block_distances[j] < query_distances[0]) {
+                            maxheap_replace_top(
+                                    k,
+                                    query_distances,
+                                    query_labels,
+                                    block_distances[j],
+                                    reordered_to_original[block_begin + j]);
+                        }
+                    }
+                    continue;
+                }
+
+                scalar_blocks_scanned++;
+
+                for (idx_t j = block_begin; j < block_end; j++) {
+                    idx_t original_id = reordered_to_original[j];
+                    if (sel && !sel->is_member(original_id)) {
+                        continue;
+                    }
+                    float distance = (*storage_dis)(j);
+                    if (distance < query_distances[0]) {
+                        maxheap_replace_top(
+                                k,
+                                query_distances,
+                                query_labels,
+                                distance,
+                                original_id);
+                    }
+                }
+            }
+            block_scan_time_s += (getmillisecs() - block_scan_t0) * 1e-3;
+
+            maxheap_reorder(k, query_distances, query_labels);
+            if (is_similarity_metric(metric_type)) {
+                for (idx_t j = 0; j < k; j++) {
+                    query_distances[j] = -query_distances[j];
+                }
+            }
+        }
+    }
+
+            mutable_self.last_search_profile.total_time_s =
+                (getmillisecs() - total_t0) * 1e-3;
+            mutable_self.last_search_profile.centroid_search_time_s =
+                centroid_search_time_s;
+                mutable_self.last_search_profile.centroid_distance_compute_time_s =
+                    centroid_distance_compute_time_s;
+                mutable_self.last_search_profile.centroid_traversal_time_s = std::max(
+                    0.0,
+                    centroid_search_time_s - centroid_distance_compute_time_s);
+            mutable_self.last_search_profile.block_scan_time_s =
+                block_scan_time_s;
+            mutable_self.last_search_profile.queries = n;
+            mutable_self.last_search_profile.centroid_hnsw_searches =
+                centroid_hnsw_searches;
+            mutable_self.last_search_profile.centroid_hnsw_candidate_exhaustions =
+                centroid_hnsw_candidate_exhaustions;
+            mutable_self.last_search_profile.centroid_hnsw_distance_computations =
+                centroid_hnsw_distance_computations;
+            mutable_self.last_search_profile.centroid_hnsw_hops =
+                centroid_hnsw_hops;
+            mutable_self.last_search_profile.blocks_scanned = blocks_scanned;
+            mutable_self.last_search_profile.batch16_blocks_scanned =
+                batch16_blocks_scanned;
+            mutable_self.last_search_profile.scalar_blocks_scanned =
+                scalar_blocks_scanned;
+            mutable_self.last_search_profile.vectors_scanned = vectors_scanned;
+}
+
+void IndexHNSWSQ::reconstruct(idx_t key, float* recons) const {
+    if (!original_database.empty()) {
+        FAISS_THROW_IF_NOT_FMT(
+                key >= 0 && key < ntotal,
+                "key %" PRId64 " out of bounds",
+                int64_t(key));
+        memcpy(
+                recons,
+                original_database.data() + key * d,
+                sizeof(float) * d);
+        return;
+    }
+
+    if (!original_to_reordered.empty()) {
+        FAISS_THROW_IF_NOT_FMT(
+                key >= 0 && key < original_to_reordered.size(),
+                "key %" PRId64 " out of bounds",
+                int64_t(key));
+        storage->reconstruct(original_to_reordered[key], recons);
+        return;
+    }
+    storage->reconstruct(key, recons);
+}
+
+void IndexHNSWSQ::reset() {
+    clear_hnswsq_block_state(*this);
+    IndexHNSW::reset();
+}
 
 /**************************************************************
  * IndexHNSW2Level implementation

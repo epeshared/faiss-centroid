@@ -1408,8 +1408,10 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         READ1(idxp->code_size);
         read_vector(idxp->codes, f);
         idx = std::move(idxp);
-    } else if (
+        } else if (
             h == fourcc("IHNf") || h == fourcc("IHNp") || h == fourcc("IHNs") ||
+            h == fourcc("IHS2") ||
+            h == fourcc("IHS3") ||
             h == fourcc("IHN2") || h == fourcc("IHNc") || h == fourcc("IHc2") ||
             h == fourcc("IHfP")) {
         std::unique_ptr<IndexHNSW> idxhnsw;
@@ -1422,7 +1424,7 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         if (h == fourcc("IHNp")) {
             idxhnsw = std::make_unique<IndexHNSWPQ>();
         }
-        if (h == fourcc("IHNs")) {
+        if (h == fourcc("IHNs") || h == fourcc("IHS2") || h == fourcc("IHS3")) {
             idxhnsw = std::make_unique<IndexHNSWSQ>();
         }
         if (h == fourcc("IHN2")) {
@@ -1462,6 +1464,27 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         idxhnsw->own_fields = idxhnsw->storage != nullptr;
         if (h == fourcc("IHNp") && !(io_flags & IO_FLAG_PQ_SKIP_SDC_TABLE)) {
             dynamic_cast<IndexPQ*>(idxhnsw->storage)->pq.compute_sdc_table();
+        }
+        if (h == fourcc("IHS2") || h == fourcc("IHS3")) {
+            auto idxsq = dynamic_cast<IndexHNSWSQ*>(idxhnsw.get());
+            READ1(idxsq->use_block_centroid_search);
+            READVECTOR(idxsq->block_offsets);
+            READVECTOR(idxsq->reordered_to_original);
+            READVECTOR(idxsq->original_to_reordered);
+            if (h == fourcc("IHS3")) {
+                READVECTOR(idxsq->original_database);
+            }
+            READVECTOR(idxsq->block_centroids);
+            read_HNSW(idxsq->centroid_hnsw, f);
+                idxsq->centroid_storage = IndexScalarQuantizer(
+                    idxsq->d,
+                    ScalarQuantizer::QT_bf16,
+                    idxsq->metric_type);
+            if (!idxsq->block_centroids.empty()) {
+                idx_t nblocks = idxsq->block_centroids.size() / idxsq->d;
+                idxsq->centroid_storage.add(
+                        nblocks, idxsq->block_centroids.data());
+            }
         }
         idx = std::move(idxhnsw);
     } else if (

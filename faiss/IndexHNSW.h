@@ -197,16 +197,65 @@ struct IndexHNSWPQ : IndexHNSW {
     void train(idx_t n, const float* x) override;
 };
 
+// Search profiling for the optional HNSWSQ BF16 block-centroid path.
+// Non-BF16 HNSWSQ instances keep this at its default-zero state.
+struct HNSWSQSearchProfile {
+        double total_time_s = 0.0;
+        double centroid_search_time_s = 0.0;
+        double centroid_distance_compute_time_s = 0.0;
+        double centroid_traversal_time_s = 0.0;
+        double block_scan_time_s = 0.0;
+        idx_t queries = 0;
+        idx_t centroid_hnsw_searches = 0;
+        idx_t centroid_hnsw_candidate_exhaustions = 0;
+        idx_t centroid_hnsw_distance_computations = 0;
+        idx_t centroid_hnsw_hops = 0;
+        idx_t blocks_scanned = 0;
+        idx_t batch16_blocks_scanned = 0;
+        idx_t scalar_blocks_scanned = 0;
+        idx_t vectors_scanned = 0;
+};
+
 /** SQ index topped with a HNSW structure to access elements
  *  more efficiently.
  */
 struct IndexHNSWSQ : IndexHNSW {
+        static constexpr idx_t kBlockSize = 16;
+
+        // The fields below are only used by the optional HNSWSQ BF16
+        // block-centroid path. Non-BF16 HNSWSQ instances ignore them.
+        // Runtime enablement is controlled by the
+        // FAISS_HNSWSQ_BF16_USE_BLOCK_CENTROID_SEARCH environment variable.
+        bool use_block_centroid_search = false;
+        std::vector<idx_t> block_offsets;
+        std::vector<idx_t> reordered_to_original;
+        std::vector<idx_t> original_to_reordered;
+        std::vector<float> original_database;
+        std::vector<float> block_centroids;
+        IndexScalarQuantizer centroid_storage;
+        HNSW centroid_hnsw;
+        mutable HNSWSQSearchProfile last_search_profile;
+
     IndexHNSWSQ();
     IndexHNSWSQ(
             int d,
             ScalarQuantizer::QuantizerType qtype,
             int M,
             MetricType metric = METRIC_L2);
+
+    void add(idx_t n, const float* x) override;
+
+    void search(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params = nullptr) const override;
+
+    void reconstruct(idx_t key, float* recons) const override;
+
+    void reset() override;
 };
 
 /** 2-level code structure with fast random access

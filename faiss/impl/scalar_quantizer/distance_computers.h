@@ -7,7 +7,10 @@
 
 #pragma once
 
+#include <cstring>
+
 #include <faiss/impl/ScalarQuantizer.h>
+#include <faiss/impl/scalar_quantizer/amx_bf16_block16.h>
 #include <faiss/impl/scalar_quantizer/quantizers.h>
 #include <faiss/impl/scalar_quantizer/similarities.h>
 #include <faiss/utils/simd_levels.h>
@@ -82,6 +85,44 @@ struct DCBF16IPDpbf16 : SQDistanceComputer {
         return compute_code_ip_bf16(qbf16.data(), c);
     }
 };
+
+#if defined(FAISS_ENABLE_HNSWSQ_BLOCK_AMX)
+template <SIMDLevel SL>
+struct DCBF16IPAmx : DCBF16IPDpbf16<SL> {
+    std::vector<uint16_t> packed_codes;
+
+    DCBF16IPAmx(size_t d, const std::vector<float>& trained)
+            : DCBF16IPDpbf16<SL>(d, trained), packed_codes(16 * d) {}
+
+    void distances_batch_16(const idx_t* idx, size_t count, float* dis) override {
+        if (count == 0) {
+            return;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            const auto* src = reinterpret_cast<const uint16_t*>(
+                    this->codes + idx[i] * this->code_size);
+            std::memcpy(
+                    packed_codes.data() + i * this->quant.d,
+                    src,
+                    this->quant.d * sizeof(uint16_t));
+        }
+
+        if (detail::hnswsq_bf16_amx_batch_x16_single_query(
+                    packed_codes.data(),
+                    this->qbf16.data(),
+                    this->quant.d,
+                    count,
+                    dis) == 0) {
+            return;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            dis[i] = this->query_to_code(this->codes + idx[i] * this->code_size);
+        }
+    }
+};
+#endif
 
 #endif
 

@@ -162,7 +162,11 @@ SQDistanceComputer* select_distance_computer_body(
                     SL2 == SIMDLevel::AVX512 &&
                     std::is_same_v<Sim, SimilarityIP<SIMDLevel::AVX512>>) {
                 if (d % 32 == 0) {
+#if defined(FAISS_ENABLE_HNSWSQ_BLOCK_AMX)
+                    return new DCBF16IPAmx<SL2>(d, trained);
+#else
                     return new DCBF16IPDpbf16<SL2>(d, trained);
+#endif
                 }
             }
 #endif
